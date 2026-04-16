@@ -112,10 +112,16 @@ def get_transcript(video_id: str, language: str = "en", assemblyai_key: str = ""
     except VideoUnavailable:
         return None, "영상을 찾을 수 없습니다. URL을 확인해 주세요."
     except TranscriptsDisabled:
-        # 자막이 없으면 → AssemblyAI(클라우드) 또는 Whisper(로컬) 사용
+        # ① Whisper 로컬 음성인식 먼저 시도 (로컬에서 작동, 클라우드에서 403으로 실패)
+        result, msg = get_transcript_via_whisper(video_id)
+        if result is not None:
+            return result, msg
+
+        # ② Whisper 실패(클라우드 환경) → AssemblyAI 시도
         if assemblyai_key and assemblyai_key != "여기에_API_키_입력":
             return get_transcript_via_assemblyai(video_id, assemblyai_key)
-        return get_transcript_via_whisper(video_id)
+
+        return None, msg
     except Exception as e:
         return None, f"알 수 없는 오류: {str(e)}"
 
