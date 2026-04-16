@@ -200,49 +200,76 @@ def get_transcript_via_whisper(video_id: str, model_size: str = "tiny") -> tuple
 def get_transcript_via_assemblyai(video_id: str, api_key: str) -> tuple[list | None, str]:
     """
     AssemblyAI API로 YouTube 음성을 텍스트로 변환합니다.
-    클라우드 서버(Streamlit Cloud 등)에서도 동작합니다.
 
     흐름:
-      ① yt-dlp로 YouTube 오디오 스트림 URL 추출 (다운로드 아님)
-      ② 해당 URL을 AssemblyAI에 전달
-      ③ AssemblyAI가 자체 서버에서 다운로드 & 음성인식
+      ① pytubefix 또는 yt-dlp 로 오디오 파일 다운로드
+      ② AssemblyAI 업로드 엔드포인트에 파일 직접 업로드
+      ③ AssemblyAI가 음성인식 처리
       ④ 문장 단위 결과 반환
     """
-    import yt_dlp
     import requests
     import time
+    import tempfile
+    import glob
 
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    headers = {"authorization": api_key, "content-type": "application/json"}
+    yt_url = f"https://www.youtube.com/watch?v={video_id}"
+    auth_headers = {"authorization": api_key}
 
-    # ① yt-dlp로 오디오 직접 스트림 URL 추출 (파일 다운로드 없음)
+    with tempfile.TemporaryDirectory() as tmpdir:
+
+        # ① 오디오 다운로드 (pytubefix 우선, yt-dlp 폴백)
+        audio_file = None
+
+        try:
+            from pytubefix import YouTube
+            yt = YouTube(yt_url, use_oauth=False, allow_oauth_cache=False)
+            stream = yt.streams.filter(only_audio=True).order_by("abr").last()
+            if stream:
+                audio_file = stream.download(output_path=tmpdir, filename="audio")
+        except Exception:
+            pass
+
+        if not audio_file or not os.path.exists(audio_file):
+            try:
+                import yt_dlp
+                tpl = os.path.join(tmpdir, "audio.%(ext)s")
+                ydl_opts = {
+                    "format": "bestaudio[ext=m4a]/bestaudio",
+                    "outtmpl": tpl,
+                    "quiet": True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([yt_url])
+                files = glob.glob(os.path.join(tmpdir, "audio.*"))
+                if files:
+                    audio_file = files[0]
+            except Exception as e:
+                return None, f"오디오 다운로드 실패: {str(e)}"
+
+        if not audio_file or not os.path.exists(audio_file):
+            return None, "오디오 파일을 다운로드할 수 없습니다. 클라우드 서버에서 YouTube가 차단될 수 있습니다."
+
+        # ② AssemblyAI에 파일 직접 업로드
+        try:
+            with open(audio_file, "rb") as f:
+                upload_resp = requests.post(
+                    "https://api.assemblyai.com/v2/upload",
+                    headers={"authorization": api_key},
+                    data=f,
+                    timeout=120,
+                )
+            upload_resp.raise_for_status()
+            upload_url = upload_resp.json()["upload_url"]
+        except Exception as e:
+            return None, f"AssemblyAI 업로드 실패: {str(e)}"
+
+    # ③ 트랜스크립션 요청
     try:
-        ydl_opts = {"format": "bestaudio[ext=m4a]/bestaudio", "quiet": True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        # formats 리스트에서 오디오 URL 가져오기
-        audio_url = None
-        if "url" in info:
-            audio_url = info["url"]
-        elif "formats" in info:
-            for fmt in reversed(info["formats"]):
-                if fmt.get("acodec") != "none" and fmt.get("url"):
-                    audio_url = fmt["url"]
-                    break
-
-        if not audio_url:
-            return None, "오디오 URL 추출 실패"
-
-    except Exception as e:
-        return None, f"YouTube 정보 추출 실패: {str(e)}"
-
-    # ② AssemblyAI에 트랜스크립션 요청
-    try:
+        json_headers = {**auth_headers, "content-type": "application/json"}
         resp = requests.post(
             "https://api.assemblyai.com/v2/transcript",
-            json={"audio_url": audio_url, "language_detection": True},
-            headers=headers,
+            json={"audio_url": upload_url, "language_detection": True},
+            headers=json_headers,
             timeout=30,
         )
         resp.raise_for_status()
@@ -250,31 +277,30 @@ def get_transcript_via_assemblyai(video_id: str, api_key: str) -> tuple[list | N
     except Exception as e:
         return None, f"AssemblyAI 요청 실패: {str(e)}"
 
-    # ③ 완료될 때까지 폴링 (5초 간격, 최대 10분)
-    polling_url = f"https://api.assemblyai.com/v2/transcript/{transcript_id}"
+    # ④ 완료될 때까지 폴링 (5초 간격, 최대 10분)
     for _ in range(120):
         time.sleep(5)
-        result = requests.get(polling_url, headers=headers, timeout=15).json()
-
+        result = requests.get(
+            f"https://api.assemblyai.com/v2/transcript/{transcript_id}",
+            headers=auth_headers, timeout=15,
+        ).json()
         if result["status"] == "completed":
             break
         elif result["status"] == "error":
             return None, f"AssemblyAI 변환 오류: {result.get('error', '알 수 없는 오류')}"
     else:
-        return None, "시간 초과: 변환이 너무 오래 걸립니다 (10분 초과)"
+        return None, "시간 초과: 변환이 10분을 넘겼습니다."
 
-    # ④ 문장 단위 결과 가져오기
+    # ⑤ 문장 단위 결과 가져오기
     try:
         sent_resp = requests.get(
             f"https://api.assemblyai.com/v2/transcript/{transcript_id}/sentences",
-            headers=headers,
-            timeout=15,
+            headers=auth_headers, timeout=15,
         ).json()
-
         items = [
             {
                 "text": s["text"],
-                "start": s["start"] / 1000.0,   # ms → 초
+                "start": s["start"] / 1000.0,
                 "duration": (s["end"] - s["start"]) / 1000.0,
             }
             for s in sent_resp.get("sentences", [])
@@ -283,10 +309,8 @@ def get_transcript_via_assemblyai(video_id: str, api_key: str) -> tuple[list | N
     except Exception:
         items = []
 
-    # sentences API 실패 시 전체 텍스트를 문장 단위로 분리
     if not items and result.get("text"):
-        raw = [{"text": result["text"], "start": 0.0, "duration": 0.0}]
-        items = merge_sentences(raw)
+        items = merge_sentences([{"text": result["text"], "start": 0.0, "duration": 0.0}])
 
     return items, "☁️ AssemblyAI로 생성된 자막"
 
