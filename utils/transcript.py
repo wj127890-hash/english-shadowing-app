@@ -180,7 +180,15 @@ def get_transcript_via_whisper(video_id: str, model_size: str = "tiny") -> tuple
     except ImportError:
         return None, "faster-whisper 미설치: pip install faster-whisper yt-dlp"
     except Exception as e:
-        return None, f"Whisper 변환 실패: {str(e)}"
+        msg = str(e)
+        if "403" in msg or "Forbidden" in msg:
+            return None, (
+                "이 영상은 자막이 없고, 클라우드 서버에서는 YouTube 영상 다운로드가 차단됩니다.\n\n"
+                "💡 해결 방법:\n"
+                "• TED, BBC, CNN 등 자막이 있는 영상을 사용하세요.\n"
+                "• 또는 내 컴퓨터에서 직접 실행하면 Whisper AI 음성인식이 동작합니다."
+            )
+        return None, f"Whisper 변환 실패: {msg}"
 
 
 def _to_dict_list(raw_data) -> list:
