@@ -48,7 +48,7 @@ def extract_video_id(url: str) -> str | None:
 # 2. 유튜브에서 자막 가져오기
 # ──────────────────────────────────────────────
 
-def get_transcript(video_id: str, language: str = "en") -> tuple[list | None, str]:
+def get_transcript(video_id: str, language: str = "en", assemblyai_key: str = "") -> tuple[list | None, str]:
     """
     유튜브 자막 API를 호출하여 자막을 가져옵니다.
 
@@ -112,7 +112,9 @@ def get_transcript(video_id: str, language: str = "en") -> tuple[list | None, st
     except VideoUnavailable:
         return None, "영상을 찾을 수 없습니다. URL을 확인해 주세요."
     except TranscriptsDisabled:
-        # 자막이 없으면 Whisper AI 음성인식으로 대체
+        # 자막이 없으면 → AssemblyAI(클라우드) 또는 Whisper(로컬) 사용
+        if assemblyai_key and assemblyai_key != "여기에_API_키_입력":
+            return get_transcript_via_assemblyai(video_id, assemblyai_key)
         return get_transcript_via_whisper(video_id)
     except Exception as e:
         return None, f"알 수 없는 오류: {str(e)}"
@@ -189,6 +191,104 @@ def get_transcript_via_whisper(video_id: str, model_size: str = "tiny") -> tuple
                 "• 또는 내 컴퓨터에서 직접 실행하면 Whisper AI 음성인식이 동작합니다."
             )
         return None, f"Whisper 변환 실패: {msg}"
+
+
+# ──────────────────────────────────────────────
+# 3-2. AssemblyAI 클라우드 음성인식 (자막 없는 영상 + 클라우드 환경용)
+# ──────────────────────────────────────────────
+
+def get_transcript_via_assemblyai(video_id: str, api_key: str) -> tuple[list | None, str]:
+    """
+    AssemblyAI API로 YouTube 음성을 텍스트로 변환합니다.
+    클라우드 서버(Streamlit Cloud 등)에서도 동작합니다.
+
+    흐름:
+      ① yt-dlp로 YouTube 오디오 스트림 URL 추출 (다운로드 아님)
+      ② 해당 URL을 AssemblyAI에 전달
+      ③ AssemblyAI가 자체 서버에서 다운로드 & 음성인식
+      ④ 문장 단위 결과 반환
+    """
+    import yt_dlp
+    import requests
+    import time
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    headers = {"authorization": api_key, "content-type": "application/json"}
+
+    # ① yt-dlp로 오디오 직접 스트림 URL 추출 (파일 다운로드 없음)
+    try:
+        ydl_opts = {"format": "bestaudio[ext=m4a]/bestaudio", "quiet": True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        # formats 리스트에서 오디오 URL 가져오기
+        audio_url = None
+        if "url" in info:
+            audio_url = info["url"]
+        elif "formats" in info:
+            for fmt in reversed(info["formats"]):
+                if fmt.get("acodec") != "none" and fmt.get("url"):
+                    audio_url = fmt["url"]
+                    break
+
+        if not audio_url:
+            return None, "오디오 URL 추출 실패"
+
+    except Exception as e:
+        return None, f"YouTube 정보 추출 실패: {str(e)}"
+
+    # ② AssemblyAI에 트랜스크립션 요청
+    try:
+        resp = requests.post(
+            "https://api.assemblyai.com/v2/transcript",
+            json={"audio_url": audio_url, "language_detection": True},
+            headers=headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        transcript_id = resp.json()["id"]
+    except Exception as e:
+        return None, f"AssemblyAI 요청 실패: {str(e)}"
+
+    # ③ 완료될 때까지 폴링 (5초 간격, 최대 10분)
+    polling_url = f"https://api.assemblyai.com/v2/transcript/{transcript_id}"
+    for _ in range(120):
+        time.sleep(5)
+        result = requests.get(polling_url, headers=headers, timeout=15).json()
+
+        if result["status"] == "completed":
+            break
+        elif result["status"] == "error":
+            return None, f"AssemblyAI 변환 오류: {result.get('error', '알 수 없는 오류')}"
+    else:
+        return None, "시간 초과: 변환이 너무 오래 걸립니다 (10분 초과)"
+
+    # ④ 문장 단위 결과 가져오기
+    try:
+        sent_resp = requests.get(
+            f"https://api.assemblyai.com/v2/transcript/{transcript_id}/sentences",
+            headers=headers,
+            timeout=15,
+        ).json()
+
+        items = [
+            {
+                "text": s["text"],
+                "start": s["start"] / 1000.0,   # ms → 초
+                "duration": (s["end"] - s["start"]) / 1000.0,
+            }
+            for s in sent_resp.get("sentences", [])
+            if s.get("text", "").strip()
+        ]
+    except Exception:
+        items = []
+
+    # sentences API 실패 시 전체 텍스트를 문장 단위로 분리
+    if not items and result.get("text"):
+        raw = [{"text": result["text"], "start": 0.0, "duration": 0.0}]
+        items = merge_sentences(raw)
+
+    return items, "☁️ AssemblyAI로 생성된 자막"
 
 
 def _to_dict_list(raw_data) -> list:

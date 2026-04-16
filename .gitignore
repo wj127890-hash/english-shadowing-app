@@ -6,3 +6,5 @@ __pycache__/
 venv/
 *.egg-info/
 .DS_Store
+# API 키가 담긴 파일 - 절대 GitHub에 올리면 안 됩니다!
+.streamlit/secrets.toml

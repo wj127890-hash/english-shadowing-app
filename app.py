@@ -148,8 +148,11 @@ if url_input:
 
     # 새 영상이면 자막을 새로 불러옵니다
     if st.session_state.video_id != video_id:
-        with st.spinner("⏳ 자막을 불러오는 중... 자막이 없으면 Whisper AI 음성인식으로 자동 생성합니다 (최대 1~2분 소요)"):
-            transcript, msg = get_transcript(video_id, lang_option)
+        # AssemblyAI API 키 읽기 (없으면 빈 문자열)
+        assemblyai_key = st.secrets.get("assemblyai_api_key", "")
+
+        with st.spinner("⏳ 자막을 불러오는 중... 자막이 없으면 AI 음성인식으로 자동 생성합니다 (최대 2~3분 소요)"):
+            transcript, msg = get_transcript(video_id, lang_option, assemblyai_key)
 
         if transcript is None:
             st.error(f"❌ 자막 로드 실패: {msg}")
